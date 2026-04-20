@@ -9,15 +9,25 @@ from PIL import Image
 from omegaconf import OmegaConf
 from pytorch_lightning import seed_everything
 import json
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*torch.meshgrid.*")
+warnings.filterwarnings("ignore", message=".*weights_only=False.*")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from utils.general_utils import load_checkpoints, instantiate_from_config
 from lvdm.data.get_actions import get_actions, parse_h5
 from lvdm.data.statistics import StatisticInfo
+import torch
+torch.set_float32_matmul_precision('high')
 
 
 def load_model(config):
     model = instantiate_from_config(config.model)
+    #Add Lora then load checkpoint
+    model.setup_lora()
     model = load_checkpoints(model, config.model, ignore_mismatched_sizes=False)
     return model
 
@@ -221,7 +231,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="help document")
 
     parser.add_argument(
-        "--input_root", "-i", type=str
+        "--input_root", "-i", type=str,
         help="Path to the input directory"
     )
     parser.add_argument(

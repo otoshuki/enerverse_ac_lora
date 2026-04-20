@@ -24,7 +24,7 @@ def load_checkpoints(model, model_cfg, ignore_mismatched_sizes=True):
         assert os.path.exists(pretrained_ckpt), "Error: Pre-trained checkpoint NOT found at:%s"%pretrained_ckpt
         mainlogger.info(">>> Load weights from pretrained checkpoint")
 
-        pl_sd = torch.load(pretrained_ckpt, map_location="cpu")
+        pl_sd = torch.load(pretrained_ckpt, map_location="cpu", weights_only=False)
         
         if 'state_dict' in pl_sd.keys():
             state_dict = pl_sd["state_dict"]

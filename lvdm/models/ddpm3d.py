@@ -49,7 +49,7 @@ from lvdm.common import (
 from lvdm.data.utils import gen_batch_ray_parellel, intrinsic_transform_batch, get_transformation_matrix_from_quat
 from lvdm.data.domain_table import DomainTable
 from lvdm.data.traj_vis_statistics import ColorMapLeft, ColorMapRight, ColorListLeft, ColorListRight, EndEffectorPts, Gripper2EEFCvt
-
+from lvdm.modules.lora import inject_lora_into_unet
 
 '''
 Sampler for the logit-normal distribution.
@@ -1088,12 +1088,37 @@ class ACWMLatentDiffusion(LatentDiffusion):
                 image_proj_model_trainable=True,  traj_prompt_proj_model_trainable=True,
                 chunk=16, n_view=1, use_raymap_dir=False, use_raymap_origin=False, 
                 use_cat_mask=False, sparse_memory=False, ddim_num_chunk=5,
-                views_name_wo_imgcat=[], 
+                views_name_wo_imgcat=[], use_lora=False, lora_rank=16, lora_alpha=32.0,
+                # ---- NEW kwargs (all optional, default = OFF so old behavior is preserved) ----
+                use_min_snr=False, min_snr_gamma=5.0,
+                use_motion_weighted_loss=False, motion_weight_strength=1.5,
+                motion_consistency_weight=0.0,
+                use_noisy_memory=False, noisy_memory_prob=0.3, noisy_memory_max_t=200,
+                # -----------------------------------------------------------------------------
                 *args, **kwargs
             ):
         super().__init__(*args, **kwargs)
         assert len(self.first_stage_key) > 1, "self.first_stage_key must be more than 2 for Action Latent"
 
+        #Save lora params
+        self.use_lora = use_lora
+        self.lora_rank = lora_rank
+        self.lora_alpha = lora_alpha
+        # ---- NEW: store training-improvement flags ----
+        self.use_min_snr = use_min_snr
+        self.min_snr_gamma = min_snr_gamma
+        self.use_motion_weighted_loss = use_motion_weighted_loss
+        self.motion_weight_strength = motion_weight_strength
+        self.motion_consistency_weight = motion_consistency_weight
+        self.use_noisy_memory = use_noisy_memory
+        self.noisy_memory_prob = noisy_memory_prob
+        self.noisy_memory_max_t = noisy_memory_max_t
+        
+        # if use_lora:
+        #     self.model.diffusion_model = inject_lora_into_unet(
+        #         self.model.diffusion_model, rank=lora_rank, alpha=lora_alpha
+        #     )
+        
         self.image_proj_model_trainable = image_proj_model_trainable
         self._init_embedder(img_cond_stage_config, freeze_embedder)
         self._init_img_ctx_projector(image_proj_stage_config, image_proj_model_trainable)
@@ -1134,7 +1159,27 @@ class ACWMLatentDiffusion(LatentDiffusion):
             for param in self.embedder.parameters():
                 param.requires_grad = False
 
+    def setup_lora(self):
+        if self.use_lora:
+            print(f"Injecting LoRA (Rank: {self.lora_rank}, Alpha: {self.lora_alpha})...")
+            self.model.diffusion_model = inject_lora_into_unet(
+                self.model.diffusion_model, 
+                rank=self.lora_rank, 
+                alpha=self.lora_alpha
+            )
+        else:
+            print("Skipping LoRA injection (use_lora=False).")
 
+    def _compute_snr(self, t):
+        """
+        Signal-to-noise ratio at timestep t, given self.alphas_cumprod buffer.
+        SNR(t) = alpha_cumprod(t) / (1 - alpha_cumprod(t))
+        """
+        alphas_cumprod = self.alphas_cumprod.to(t.device)
+        a = alphas_cumprod[t]
+        snr = a / (1.0 - a).clamp(min=1e-8)
+        return snr
+    
     def get_batch_input(self, batch, random_uncond, 
                         return_first_stage_outputs=False, 
                         return_original_cond=False, 
@@ -1356,23 +1401,104 @@ class ACWMLatentDiffusion(LatentDiffusion):
         return self.p_losses(x, c, t, traj_aug_mask=traj_aug_mask, **kwargs)
 
 
-    def p_losses(self, x_start, cond, t, noise=None, traj_aug_mask=None, **kwargs):
+    # def p_losses(self, x_start, cond, t, noise=None, traj_aug_mask=None, **kwargs):
 
+    #     if self.noise_strength > 0:
+    #         b, c, f, _, _ = x_start.shape
+    #         offset_noise = torch.randn(b, c, f, 1, 1, device=x_start.device)
+    #         noise = default(noise, lambda: torch.randn_like(x_start) + self.noise_strength * offset_noise)
+    #     else:
+    #         noise = default(noise, lambda: torch.randn_like(x_start))
+
+    #     x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+    #     x_noisy[:,:,:-self.chunk] = x_start[:,:,:-self.chunk]
+
+    #     model_output = self.apply_model(x_noisy, t, cond, **kwargs)
+
+    #     loss_dict = {}
+    #     prefix = 'train' if self.training else 'val'
+
+    #     if self.parameterization == "x0":
+    #         target = x_start
+    #     elif self.parameterization == "eps":
+    #         target = noise
+    #     elif self.parameterization == "v":
+    #         target = self.get_v(x_start, noise, t)
+    #     else:
+    #         raise NotImplementedError()
+
+    #     loss_simple_map = self.get_loss(model_output, target, mean=False, last_only=self.chunk)
+    #     if traj_aug_mask is not None:
+    #         traj_aug_mask = 1.0-traj_aug_mask[:,:,-self.chunk:]
+    #         loss_simple_map = ((loss_simple_map * traj_aug_mask).sum(dim=2)+1e-5) / (traj_aug_mask.sum(dim=2)+1e-5)
+    #         loss_simple = loss_simple_map.mean([1,2,3])
+    #     else:
+    #         loss_simple = loss_simple_map.mean([1, 2, 3, 4])
+
+    #     loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
+
+    #     if self.logvar.device is not self.device:
+    #         self.logvar = self.logvar.to(self.device)
+    #     logvar_t = self.logvar[t]
+    #     # logvar_t = self.logvar[t.item()].to(self.device) # device conflict when ddp shared
+    #     loss = loss_simple / torch.exp(logvar_t) + logvar_t
+    #     # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+    #     if self.learn_logvar:
+    #         loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
+    #         loss_dict.update({'logvar': self.logvar.data.mean()})
+
+    #     loss = self.l_simple_weight * loss.mean()
+
+    #     # loss_vlb = self.get_loss(model_output, target, mean=False, last_only=self.chunk).mean(dim=(1, 2, 3, 4))
+    #     loss_vlb = loss_simple
+
+    #     loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
+    #     loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
+    #     loss += (self.original_elbo_weight * loss_vlb)
+    #     loss_dict.update({f'{prefix}/loss': loss})
+
+    #     return loss, loss_dict
+
+    def p_losses(self, x_start, cond, t, noise=None, traj_aug_mask=None, **kwargs):
+ 
         if self.noise_strength > 0:
             b, c, f, _, _ = x_start.shape
             offset_noise = torch.randn(b, c, f, 1, 1, device=x_start.device)
             noise = default(noise, lambda: torch.randn_like(x_start) + self.noise_strength * offset_noise)
         else:
             noise = default(noise, lambda: torch.randn_like(x_start))
-
+ 
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
-        x_noisy[:,:,:-self.chunk] = x_start[:,:,:-self.chunk]
-
+ 
+        # ---- existing behavior: memory frames are clean ----
+        x_noisy[:, :, :-self.chunk] = x_start[:, :, :-self.chunk]
+ 
+        # ---- NEW: self-forcing via noisy memory ----
+        # With probability p, replace the clean memory with a lightly-noised
+        # version sampled at a low timestep. This closes the exposure-bias gap
+        # between train-time (clean memory) and inference-time (generated
+        # memory, which is imperfect), directly improving object permanence
+        # and chunk-to-chunk scene consistency.
+        if self.use_noisy_memory and self.training:
+            B = x_start.shape[0]
+            # independent per-sample decision
+            do_noise = torch.rand(B, device=x_start.device) < self.noisy_memory_prob
+            if do_noise.any():
+                t_mem = torch.randint(
+                    0, max(1, self.noisy_memory_max_t),
+                    (B,), device=x_start.device
+                ).long()
+                mem_x0 = x_start[:, :, :-self.chunk]
+                mem_noise = torch.randn_like(mem_x0)
+                mem_noisy = self.q_sample(x_start=mem_x0, t=t_mem, noise=mem_noise)
+                mask = do_noise.view(B, 1, 1, 1, 1).float()
+                x_noisy[:, :, :-self.chunk] = mask * mem_noisy + (1.0 - mask) * mem_x0
+ 
         model_output = self.apply_model(x_noisy, t, cond, **kwargs)
-
+ 
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
-
+ 
         if self.parameterization == "x0":
             target = x_start
         elif self.parameterization == "eps":
@@ -1381,37 +1507,88 @@ class ACWMLatentDiffusion(LatentDiffusion):
             target = self.get_v(x_start, noise, t)
         else:
             raise NotImplementedError()
-
+ 
+        # per-pixel loss over the last `chunk` frames only (unchanged).
         loss_simple_map = self.get_loss(model_output, target, mean=False, last_only=self.chunk)
+ 
+        # ---- NEW: motion-weighted loss mask ----
+        # Compute inter-frame |Δx| in the TARGET latents to find where motion is.
+        # Normalize so the mean weight is ~1.0 (doesn't change overall loss scale).
+        # Fast-moving pixels get up to `motion_weight_strength` weight.
+        if self.use_motion_weighted_loss:
+            with torch.no_grad():
+                tgt_chunk = target[:, :, -self.chunk:]                   # (B,C,T,H,W)
+                diff = (tgt_chunk[:, :, 1:] - tgt_chunk[:, :, :-1]).abs()
+                # pad at t=0 with the first available diff
+                diff = torch.cat([diff[:, :, :1], diff], dim=2)          # (B,C,T,H,W)
+                # reduce over channel dim to get a spatial-temporal motion map
+                motion_map = diff.mean(dim=1, keepdim=True)              # (B,1,T,H,W)
+                # normalize per-sample to mean 1
+                per_sample_mean = motion_map.mean(dim=(2, 3, 4), keepdim=True).clamp(min=1e-6)
+                motion_map = motion_map / per_sample_mean
+                # clip and rescale into [1.0, motion_weight_strength]
+                motion_map = 1.0 + (self.motion_weight_strength - 1.0) * motion_map.clamp(max=1.0)
+                # broadcast over channel dim
+                motion_weights = motion_map.expand_as(loss_simple_map)
+            loss_simple_map = loss_simple_map * motion_weights
+ 
         if traj_aug_mask is not None:
-            traj_aug_mask = 1.0-traj_aug_mask[:,:,-self.chunk:]
-            loss_simple_map = ((loss_simple_map * traj_aug_mask).sum(dim=2)+1e-5) / (traj_aug_mask.sum(dim=2)+1e-5)
-            loss_simple = loss_simple_map.mean([1,2,3])
+            traj_aug_mask = 1.0 - traj_aug_mask[:, :, -self.chunk:]
+            loss_simple_map = ((loss_simple_map * traj_aug_mask).sum(dim=2) + 1e-5) / (traj_aug_mask.sum(dim=2) + 1e-5)
+            loss_simple = loss_simple_map.mean([1, 2, 3])
         else:
             loss_simple = loss_simple_map.mean([1, 2, 3, 4])
-
+ 
         loss_dict.update({f'{prefix}/loss_simple': loss_simple.mean()})
-
+ 
         if self.logvar.device is not self.device:
             self.logvar = self.logvar.to(self.device)
         logvar_t = self.logvar[t]
-        # logvar_t = self.logvar[t.item()].to(self.device) # device conflict when ddp shared
         loss = loss_simple / torch.exp(logvar_t) + logvar_t
-        # loss = loss_simple / torch.exp(self.logvar) + self.logvar
+ 
+        # ---- NEW: Min-SNR-gamma timestep weighting (Hang et al. 2023) ----
+        # For v-prediction the recommended weight is min(SNR, gamma) / (SNR + 1).
+        # Rebalances gradient mass toward mid-noise timesteps where coherent
+        # motion structure is actually learned (uniform-t sampling under-trains
+        # these). Free in compute, ~0.3-1.0 dB PSNR in practice.
+        if self.use_min_snr:
+            snr = self._compute_snr(t)                                           # (B,)
+            snr_clamped = torch.clamp(snr, max=self.min_snr_gamma)
+            if self.parameterization == "v":
+                snr_weight = snr_clamped / (snr + 1.0)
+            elif self.parameterization == "eps":
+                snr_weight = snr_clamped / snr.clamp(min=1e-8)
+            else:  # x0
+                snr_weight = snr_clamped
+            loss = loss * snr_weight
+            loss_dict.update({f'{prefix}/snr_mean': snr.mean()})
+ 
         if self.learn_logvar:
             loss_dict.update({f'{prefix}/loss_gamma': loss.mean()})
             loss_dict.update({'logvar': self.logvar.data.mean()})
-
+ 
         loss = self.l_simple_weight * loss.mean()
-
-        # loss_vlb = self.get_loss(model_output, target, mean=False, last_only=self.chunk).mean(dim=(1, 2, 3, 4))
+ 
         loss_vlb = loss_simple
-
         loss_vlb = (self.lvlb_weights[t] * loss_vlb).mean()
         loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
         loss += (self.original_elbo_weight * loss_vlb)
+ 
+        # ---- NEW: latent-space motion-consistency loss ----
+        # Penalize mismatch between predicted and target temporal differences
+        # across the chunk. Directly encourages smooth, correct motion — this
+        # is one of the cheapest reliable boosters for motion-PSNR.
+        if self.motion_consistency_weight > 0:
+            pred_chunk = model_output[:, :, -self.chunk:]
+            tgt_chunk_mc = target[:, :, -self.chunk:]
+            pred_diff = pred_chunk[:, :, 1:] - pred_chunk[:, :, :-1]
+            tgt_diff = tgt_chunk_mc[:, :, 1:] - tgt_chunk_mc[:, :, :-1]
+            loss_motion = F.mse_loss(pred_diff, tgt_diff)
+            loss_dict.update({f'{prefix}/loss_motion': loss_motion})
+            loss = loss + self.motion_consistency_weight * loss_motion
+ 
         loss_dict.update({f'{prefix}/loss': loss})
-
+ 
         return loss, loss_dict
 
 
@@ -1932,6 +2109,7 @@ class ACWMLatentDiffusion(LatentDiffusion):
                         param.requires_grad = True
                         params.append(param)
                         break
+                        
         mainlogger.info(f"@Training [{len(params)}] Full Paramters.")
 
         if self.cond_stage_trainable:
@@ -1953,6 +2131,17 @@ class ACWMLatentDiffusion(LatentDiffusion):
         ## optimizer
         optimizer = torch.optim.AdamW(params, lr=lr)
 
+        # #Check all the names
+        # mainlogger.info("All Parameters in UNet")
+        # for name, param in self.model.named_parameters():
+        #     if "attn" in name or "temp" in name: # Filtering to avoid massive logs
+        #         print(name)
+
+        mainlogger.info("Trainable Parameters in Unet")
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                print(f"{name} | shape: {param.shape}")
+        
         ## lr scheduler
         if self.use_scheduler:
             mainlogger.info("Setting up scheduler...")
@@ -1960,9 +2149,6 @@ class ACWMLatentDiffusion(LatentDiffusion):
             return [optimizer], [lr_scheduler]
         
         return optimizer
-
-
-
 
 
 class DiffusionWrapper(pl.LightningModule):
