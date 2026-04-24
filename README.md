@@ -1,4 +1,7 @@
 # ENERVERSE-AC: Envisioning Embodied Environments with Action Condition
+## Modified for AgiBot World Challenge @ ICRA 2026
+
+This version includes new loss function and LoRA modules
 
 <div id="top" align="center">
 
